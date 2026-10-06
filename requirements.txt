@@ -1,0 +1,4 @@
+# pin exact versions once tested, e.g. fastapi==0.x.y
+fastapi
+uvicorn
+httpx
