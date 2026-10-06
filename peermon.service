@@ -1,0 +1,18 @@
+[Unit]
+Description=peermon - neighbor health monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=peermon
+Group=peermon
+EnvironmentFile=/etc/peermon.env
+WorkingDirectory=/opt/peermon
+StateDirectory=peermon
+# exactly one worker: the checker runs inside the app process
+ExecStart=/opt/peermon/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
