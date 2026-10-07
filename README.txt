@@ -73,6 +73,7 @@ FILES
   peermon.service    systemd unit
   vm-a.env           settings for VM A (site A, neighbor = vm-b)
   vm-b.env           settings for VM B (site B, neighbor = vm-a)
+  peermonctl         command-line wrapper (see PEERMONCTL below)
   install.sh         installer
   README.txt         this file
 
@@ -106,7 +107,71 @@ INSTALL
      - between the two VMs (both directions)
      - from wherever the client will run
 5. Check it:
-     curl http://<vm-ip>:8000/neighbor
+     peermonctl status
+   (or: curl http://<vm-ip>:8000/neighbor)
+
+
+PEERMONCTL - COMMAND-LINE WRAPPER
+---------------------------------
+Installed to /usr/local/bin/peermonctl. Python standard library only.
+
+By default it queries the PEER named in /etc/peermon.env, so on vm-a it asks
+vm-b and on vm-b it asks vm-a. Unlike curl, it never just fails when the
+target is down:
+
+  status    one-line summary; if the target is down, also shows this
+            node's view of it
+  health    target's identity, or a "status: down" record with the reason
+  neighbor  target's view of its peer, or a "status: down" record plus
+            this node's view of the target ("seen_from")
+  events    target's events; if the target is down, falls back to this
+            node's events (which show the peer going down) and appends a
+            final "peer_down" entry
+  history   same, for the raw checks
+
+Down reasons:
+  refused       nothing listening - VM up, app down
+  timeout       no answer - VM or network down
+  unreachable   any other network error
+  http_error    app answered with an error
+
+Options:
+  --peer            query the peer from /etc/peermon.env (default)
+  --local           query this node
+  --host URL        query any node, e.g. --host http://10.0.2.10:8000
+  --pretty          indented JSON (like jq)
+  --table           human-readable table or key/value view
+  --json            compact JSON (default, except for status)
+  --minutes N       events/history window (default 30)
+  --limit N         history row limit (default 5000)
+  --last N          show only the last N events/history rows
+  --timeout SEC     seconds before the target counts as down (default 3)
+  --watch SEC       repeat every SEC seconds until Ctrl-C
+
+Exit code: 0 = target reachable, 1 = target down, 2 = usage error.
+
+Examples:
+  peermonctl status
+  peermonctl status --watch 5
+  peermonctl neighbor --pretty
+  peermonctl events --table --minutes 60
+  peermonctl history --table --last 20
+  peermonctl events --local --pretty
+
+Example with vm-b's app stopped, run on vm-a:
+
+  $ peermonctl status
+  vm-b: DOWN  -  refused (nothing listening: VM up, app down)
+  vm-a: sees vm-b DOWN since 2026-10-07 00:13:21.317  (5 consecutive failures)
+
+  $ peermonctl events --table
+  # node=vm-a  peer=vm-b  source=local fallback: vm-b is down
+  id  ts_utc                   event         detail
+  --  -----------------------  ------------  ---------------------------------
+  1   2026-10-07 00:13:15.219  node_started  boot_id ed85eeff0a34; peer vm-b ...
+  2   2026-10-07 00:13:15.312  peer_up       from unknown
+  3   2026-10-07 00:13:21.317  peer_down     from up; refused x3; first fai...
+  -   2026-10-07 00:13:23.674  peer_down     vm-b unreachable from peermonc...
 
 
 OPERATING NOTES

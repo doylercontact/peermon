@@ -13,8 +13,9 @@ python3 -m venv /opt/peermon/venv
 /opt/peermon/venv/bin/pip install -q -r /opt/peermon/requirements.txt
 
 install -m 0644 "$ENV_FILE" /etc/peermon.env
+install -m 0755 peermonctl /usr/local/bin/peermonctl
 install -m 0644 peermon.service /etc/systemd/system/peermon.service
 systemctl daemon-reload
 systemctl enable --now peermon
 sleep 2
-curl -s http://127.0.0.1:8000/health; echo
+peermonctl health --local --pretty
