@@ -1,0 +1,16 @@
+[Unit]
+Description=peermon host firewall (restricts peermon port to peer and allowed hosts)
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=peermon.service
+# re-apply if nftables.service is restarted (it flushes the whole ruleset)
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/peermon-firewall apply
+ExecStop=/usr/local/bin/peermon-firewall remove
+
+[Install]
+WantedBy=multi-user.target

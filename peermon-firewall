@@ -1,0 +1,137 @@
+#!/bin/bash
+# peermon-firewall - host firewall for peermon's port (default 8000)
+#
+# Uses a dedicated nftables table (inet peermon) that touches ONLY tcp/8000:
+#   accept from localhost, the peer (from PEER_URL) and FIREWALL_ALLOW hosts;
+#   drop everything else. SSH and all other traffic are not affected.
+#
+# Usage: sudo peermon-firewall enable    apply now and at every boot
+#        sudo peermon-firewall disable   remove rules and stop applying at boot
+#        sudo peermon-firewall reload    re-read /etc/peermon.env and re-apply
+#        sudo peermon-firewall status    show rules, counters and boot state
+#        sudo peermon-firewall apply     low-level: apply once (used by systemd)
+#        sudo peermon-firewall remove    low-level: remove once (used by systemd)
+set -euo pipefail
+
+ENV_FILE=${PEERMON_ENV:-/etc/peermon.env}
+PORT=${PEERMON_PORT:-8000}
+TABLE="inet peermon"
+UNIT=peermon-firewall.service
+UFW_TAG=peermon
+
+die() { echo "peermon-firewall: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"; }
+ufw_active() { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; }
+
+load_env() {
+  [ -r "$ENV_FILE" ] || die "cannot read $ENV_FILE"
+  PEER_URL=$(sed -n 's/^PEER_URL=//p' "$ENV_FILE" | tail -1)
+  FIREWALL_ALLOW=$(sed -n 's/^FIREWALL_ALLOW=//p' "$ENV_FILE" | tail -1 | tr -d '"'"'"'')
+  [ -n "$PEER_URL" ] || die "PEER_URL not set in $ENV_FILE"
+}
+
+# Resolve a host, IP or CIDR to one or more addresses/CIDRs.
+resolve() {
+  local h=$1
+  if [[ $h =~ ^[0-9.]+(/[0-9]+)?$ || $h == *:* ]]; then
+    echo "$h"
+  else
+    getent ahosts "$h" | awk '{print $1}' | sort -u || true
+  fi
+}
+
+build_sources() {
+  local peer_host
+  peer_host=$(echo "$PEER_URL" | sed -E 's#^[a-zA-Z]+://##; s#^\[([^]]+)\].*#\1#; s#[:/].*$##')
+  SOURCES=()
+  for h in $peer_host $FIREWALL_ALLOW; do
+    local r
+    r=$(resolve "$h")
+    [ -n "$r" ] || die "cannot resolve '$h'"
+    while read -r a; do [ -n "$a" ] && SOURCES+=("$a"); done <<< "$r"
+  done
+  V4=(); V6=()
+  for s in "${SOURCES[@]}"; do
+    if [[ $s == *:* ]]; then V6+=("$s"); else V4+=("$s"); fi
+  done
+}
+
+join() { local IFS=","; echo "$*"; }
+
+ufw_remove() {
+  ufw_active || return 0
+  local n
+  while n=$(ufw status numbered | grep "# $UFW_TAG\$" | head -1 | sed -E 's/^\[ *([0-9]+)\].*/\1/'); [ -n "$n" ]; do
+    ufw --force delete "$n" >/dev/null
+  done
+}
+
+ufw_apply() {
+  ufw_active || return 0
+  ufw_remove
+  for s in "${SOURCES[@]}"; do
+    ufw allow from "$s" to any port "$PORT" proto tcp comment "$UFW_TAG" >/dev/null 2>&1 \
+      || echo "peermon-firewall: warning: ufw could not add a rule for $s" >&2
+  done
+  echo "ufw is active: added matching 'ufw allow' rules (comment: $UFW_TAG)"
+}
+
+apply() {
+  need_root
+  command -v nft >/dev/null || die "nft not found (apt-get install nftables)"
+  load_env
+  build_sources
+  local rules=""
+  [ ${#V4[@]} -gt 0 ] && rules+="    tcp dport $PORT ip saddr { $(join "${V4[@]}") } accept"$'\n'
+  [ ${#V6[@]} -gt 0 ] && rules+="    tcp dport $PORT ip6 saddr { $(join "${V6[@]}") } accept"$'\n'
+  # add+delete+define in one transaction: atomic and idempotent
+  nft -f - <<NFT
+add table $TABLE
+delete table $TABLE
+table $TABLE {
+  chain input {
+    type filter hook input priority -1; policy accept;
+    iif "lo" tcp dport $PORT accept
+$rules    tcp dport $PORT counter drop comment "peermon: not on allow list"
+  }
+}
+NFT
+  ufw_apply
+  echo "peermon firewall applied: tcp/$PORT allowed from localhost ${SOURCES[*]}; all others dropped"
+}
+
+remove() {
+  need_root
+  if command -v nft >/dev/null && nft list table $TABLE >/dev/null 2>&1; then
+    nft delete table $TABLE
+  fi
+  ufw_remove
+  echo "peermon firewall removed: tcp/$PORT no longer restricted by peermon"
+}
+
+status() {
+  local state
+  state=$(systemctl is-enabled $UNIT 2>/dev/null) || true
+  case "$state" in enabled) ;; disabled) ;; *) state="not installed" ;; esac
+  echo "boot state: $state"
+  if command -v nft >/dev/null && nft list table $TABLE >/dev/null 2>&1; then
+    echo "rules: active"
+    nft list table $TABLE
+  else
+    echo "rules: not active (tcp/$PORT unrestricted by peermon)"
+  fi
+  if ufw_active; then
+    echo "ufw: active"
+    ufw status | grep "# $UFW_TAG" || echo "  (no peermon ufw rules)"
+  fi
+}
+
+case "${1:-}" in
+  enable)  need_root; systemctl enable $UNIT >/dev/null 2>&1 || true; systemctl restart $UNIT 2>/dev/null || apply ;;
+  disable) need_root; systemctl disable --now $UNIT >/dev/null 2>&1 || true; remove ;;
+  reload)  need_root; apply ;;
+  apply)   apply ;;
+  remove)  remove ;;
+  status)  status ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

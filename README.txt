@@ -74,7 +74,10 @@ FILES
   vm-a.env           settings for VM A (site A, neighbor = vm-b)
   vm-b.env           settings for VM B (site B, neighbor = vm-a)
   peermonctl         command-line wrapper (see PEERMONCTL below)
-  install.sh         installer
+  peermon-firewall   host firewall for port 8000 (see HOST FIREWALL below)
+  peermon-firewall.service   systemd unit that re-applies the firewall at boot
+  install.sh         installer (safe to re-run)
+  uninstall.sh       uninstaller (safe to re-run)
   README.txt         this file
 
 
@@ -89,26 +92,100 @@ SETTINGS (env file, installed as /etc/peermon.env)
   FAIL_THRESHOLD   consecutive failures before DOWN (default 3)
   DB_PATH          history file (default /var/lib/peermon/checks.db)
   RETENTION_HOURS  how long history is kept (default 72)
+  FIREWALL_ALLOW   extra hosts allowed to reach port 8000 when the host
+                   firewall is enabled: space-separated IPs, CIDRs or
+                   hostnames, e.g. FIREWALL_ALLOW="10.0.5.20 10.0.6.0/24".
+                   The peer is always allowed; leave empty for peer only.
 
 
 INSTALL
 -------
-1. Copy all files to each VM.
-2. Edit the env file for that VM and replace the placeholder with the
-   neighbor's IP:
+1. Copy all files to each VM (git clone or scp).
+2. Edit the env file for that VM:
      vm-a.env:  PEER_URL=http://<vm-b-ip>:8000
      vm-b.env:  PEER_URL=http://<vm-a-ip>:8000
+   If you will use the host firewall and want a monitoring host to reach
+   port 8000, add it to FIREWALL_ALLOW as well.
 3. Run the installer:
      on VM A:   sudo ./install.sh vm-a.env
      on VM B:   sudo ./install.sh vm-b.env
-   It installs python3-venv and chrony, creates a "peermon" service user,
-   installs the app under /opt/peermon, and starts it under systemd.
-4. Open TCP port 8000:
+   Add --firewall to also turn on the host firewall:
+                sudo ./install.sh --firewall vm-a.env
+   The installer installs python3-venv, chrony and nftables, creates a
+   "peermon" service user, installs the app under /opt/peermon, installs
+   peermonctl and peermon-firewall to /usr/local/bin, and starts peermon
+   under systemd.
+4. Open TCP port 8000 in the platform firewall (AWS security group, Azure
+   NSG, Nutanix Flow or router ACL):
      - between the two VMs (both directions)
-     - from wherever the client will run
+     - from wherever the client or a monitoring host will run
 5. Check it:
      peermonctl status
-   (or: curl http://<vm-ip>:8000/neighbor)
+     sudo peermon-firewall status
+
+Re-running install.sh is safe: it updates the code and settings in place
+and restarts peermon. Use it after a git pull or after editing the env file.
+
+
+HOST FIREWALL
+-------------
+Optional, on top of the platform firewall. On AWS the security group is
+the main control and this is defense in depth; on Nutanix without Flow it
+may be the only control on port 8000.
+
+How it works:
+  - A dedicated nftables table (inet peermon) that touches ONLY tcp/8000.
+  - Accepts port 8000 from: localhost, the peer (taken from PEER_URL), and
+    any FIREWALL_ALLOW hosts. Drops everything else.
+  - Dropped, not rejected, to match security-group behavior: a host that
+    is not allowed sees a timeout.
+  - SSH and all other traffic are untouched, so it cannot lock you out.
+  - Covers IPv4 and IPv6. Hostnames are resolved when the rules are applied.
+  - A systemd unit (peermon-firewall.service) re-applies the rules at boot.
+  - If ufw is active, matching "ufw allow" rules (comment: peermon) are
+    added too, because ufw would otherwise block port 8000 on its own.
+
+Commands:
+  sudo peermon-firewall enable    apply now and at every boot
+  sudo peermon-firewall disable   remove the rules and stop applying at boot
+  sudo peermon-firewall reload    re-read /etc/peermon.env and re-apply
+  sudo peermon-firewall status    rules, drop counter and boot state
+
+Post-install changes, e.g. adding a monitoring host:
+  1. sudo nano /etc/peermon.env      (edit FIREWALL_ALLOW)
+  2. sudo peermon-firewall reload
+No reinstall or peermon restart is needed.
+
+Example status:
+  $ sudo peermon-firewall status
+  boot state: enabled
+  rules: active
+  table inet peermon {
+    chain input {
+      type filter hook input priority filter - 1; policy accept;
+      iif "lo" tcp dport 8000 accept
+      tcp dport 8000 ip saddr { 10.0.2.10, 10.0.5.20 } accept
+      tcp dport 8000 counter packets 12 bytes 720 drop comment "peermon: not on allow list"
+    }
+  }
+The drop counter shows how many packets from unlisted hosts were blocked.
+
+Note: restarting nftables.service flushes all rules; peermon-firewall
+re-applies automatically when that happens. If you flush rules by hand
+(nft flush ruleset), run: sudo peermon-firewall reload
+
+
+UNINSTALL
+---------
+  sudo ./uninstall.sh            remove peermon, keep the check history
+  sudo ./uninstall.sh --purge    also delete the history and the peermon user
+
+Removes: the peermon and peermon-firewall services, the firewall rules
+(and any peermon ufw rules), /opt/peermon, /usr/local/bin/peermonctl,
+/usr/local/bin/peermon-firewall and /etc/peermon.env.
+
+By default the history in /var/lib/peermon is kept, because it is your
+test evidence. Safe to run more than once.
 
 
 PEERMONCTL - COMMAND-LINE WRAPPER
@@ -182,6 +259,8 @@ OPERATING NOTES
   machines, so their clocks must agree; clock_skew_ms shows how well they do.
 - Pin exact package versions in requirements.txt once tested.
 - Useful commands:
+    peermonctl status --watch 5
+    sudo peermon-firewall status
     systemctl status peermon
     journalctl -u peermon -f
     sudo systemctl restart peermon
